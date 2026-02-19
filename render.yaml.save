@@ -12,7 +12,8 @@ services:
       - key: DIGEST_TIME
         value: "20:00"
       - key: DATA_DIR
-        value: "/app/data"services:
+        value: "/app/data"
+	services:
   - type: web
     name: telegram-assistant
     env: python

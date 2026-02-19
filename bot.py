@@ -1,4 +1,332 @@
-import os
+services:
+  - type: web
+    name: telegram-assistant
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: YOUR_CHAT_ID
+        sync: false
+      - key: DIGEST_TIME
+        value: "20:00"
+      - key: DATA_DIR
+        value: "/app/data"import os
+import asyncio
+import sqlite3
+import datetime
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from dotenv import load_dotenv
+import dateparser
+from aiohttp import web
+
+load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = int(os.getenv("YOUR_CHAT_ID"))
+DIGEST_TIME = os.getenv("DIGEST_TIME", "20:00")
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    db_path = os.path.join(DATA_DIR, 'tasks.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    sql = "CREATE TABLE IF NOT EXISTS tasks "
+    sql += "(id INTEGER PRIMARY KEY, task_text TEXT, "
+    sql += "event_time DATETIME, reminded_24h BOOLEAN DEFAULT 0, "
+    sql += "reminded_1h BOOLEAN DEFAULT 0, "
+    sql += "created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    c.execute(sql)
+    conn.commit()
+    conn.close()
+    print("DB initialized at", db_path)
+
+def parse_datetime(text):
+    now = datetime.datetime.now()
+    parsed = dateparser.parse(text, 
+        settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': 
+now})
+    if parsed and parsed.hour == 0 and parsed.minute == 0:
+        parsed = parsed.replace(hour=9, minute=0)
+    if not parsed:
+        parsed = now.replace(hour=9, minute=0)
+        parsed += datetime.timedelta(days=1)
+    return parsed
+
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    msg = "Голосовые пока не работают.\n"
+    msg += "Отправьте текстом: завтра в 10:00 врач"
+    await message.answer(msg)
+
+@dp.message()
+async def handle_text(message: types.Message):
+    text = message.text
+    if text.startswith('/'):
+        return
+    try:
+        event_time = parse_datetime(text)
+        db_path = os.path.join(DATA_DIR, 'tasks.db')
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        sql = "INSERT INTO tasks (task_text, event_time) VALUES (?, 
+?)"
+        c.execute(sql, (text, event_time.strftime('%Y-%m-%d 
+%H:%M')))
+        conn.commit()
+        conn.close()
+        
+        response = "Записал!\n\n"
+        response += text + "\n"
+        response += event_time.strftime('%d.%m.%Y в %H:%M') + "\n"
+        response += "Напомню за 1 день и за 1 час!"
+        await message.answer(response)
+    except Exception as e:
+        await message.answer("Ошибка: " + str(e))
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    msg = "Привет! Я ваш ассистент.\n\n"
+    msg += "Отправьте задачу:\n"
+    msg += "завтра в 10:00 врач\n"
+    msg += "в пятницу в 14:00 встреча\n\n"
+    msg += "Команды:\n"
+    msg += "/tasks - все задачи\n"
+    msg += "/tomorrow - на завтра\n"
+    msg += "/week - на неделю\n"
+    msg += "/clear - удалить всё"
+    await message.answer(msg)
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(message: types.Message):
+    try:
+        db_path = os.path.join(DATA_DIR, 'tasks.db')
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT * FROM tasks ORDER BY event_time")
+        tasks = c.fetchall()
+        conn.close()
+        
+        if not tasks:
+            await message.answer("Нет задач")
+            return
+        
+        response = "Ваши задачи:\n\n"
+        for task in tasks:
+            response += "- " + task[1] + "\n"
+            response += "  " + task[2] + "\n\n"
+        await message.answer(response)
+    except Exception as e:
+        await message.answer("Ошибка: " + str(e))
+
+@dp.message(Command("tomorrow"))
+async def cmd_tomorrow(message: types.Message):
+    try:
+        tomorrow = (datetime.datetime.now() + 
+datetime.timedelta(days=1))
+        date_str = tomorrow.strftime('%Y-%m-%d')
+        
+        db_path = os.path.join(DATA_DIR, 'tasks.db')
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        sql = "SELECT * FROM tasks WHERE event_time LIKE ? ORDER BY 
+event_time"
+        c.execute(sql, (date_str + "%",))
+        tasks = c.fetchall()
+        conn.close()
+        
+        if not tasks:
+            await message.answer("На завтра задач нет")
+            return
+        
+        response = "На завтра:\n\n"
+        for task in tasks:
+            time_part = task[2].split(' ')[1] if ' ' in task[2] else 
+'00:00'
+            response += time_part + " - " + task[1] + "\n"
+        await message.answer(response)
+    except Exception as e:
+        await message.answer("Ошибка: " + str(e))
+
+@dp.message(Command("week"))
+async def cmd_week(message: types.Message):
+    try:
+        now = datetime.datetime.now()
+        week_end = now + datetime.timedelta(days=7)
+        
+        db_path = os.path.join(DATA_DIR, 'tasks.db')
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        sql = "SELECT * FROM tasks WHERE event_time BETWEEN ? AND ?"
+        c.execute(sql, (now.strftime('%Y-%m-%d'), 
+week_end.strftime('%Y-%m-%d')))
+        tasks = c.fetchall()
+        conn.close()
+        
+        if not tasks:
+            await message.answer("На неделю задач нет")
+            return
+        
+        response = "На неделю:\n\n"
+        for task in tasks:
+            response += task[2] + " - " + task[1] + "\n"
+        await message.answer(response)
+    except Exception as e:
+        await message.answer("Ошибка: " + str(e))
+
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    try:
+        db_path = os.path.join(DATA_DIR, 'tasks.db')
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("DELETE FROM tasks")
+        conn.commit()
+        conn.close()
+        await message.answer("Все задачи удалены")
+    except Exception as e:
+        await message.answer("Ошибка: " + str(e))
+
+async def check_reminders():
+    print("Reminders started")
+    while True:
+        try:
+            now = datetime.datetime.now()
+            db_path = os.path.join(DATA_DIR, 'tasks.db')
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute("SELECT * FROM tasks WHERE reminded_24h = 0 OR 
+reminded_1h = 0")
+            tasks = c.fetchall()
+            
+            for task in tasks:
+                event_time = datetime.datetime.strptime(task[2], 
+'%Y-%m-%d %H:%M')
+                diff = event_time - now
+                
+                day_diff = datetime.timedelta(days=1)
+                hour_diff = datetime.timedelta(hours=1)
+                ten_min = datetime.timedelta(minutes=10)
+                
+                if day_diff >= diff >= day_diff - ten_min:
+                    if not task[3]:
+                        msg = "Напоминание (1 день)\n\n"
+                        msg += task[1] + "\n"
+                        msg += "Завтра в " + 
+event_time.strftime('%H:%M')
+                        await bot.send_message(CHAT_ID, msg)
+                        c.execute("UPDATE tasks SET reminded_24h = 1 
+WHERE id = ?", (task[0],))
+                        conn.commit()
+                
+                if hour_diff >= diff >= hour_diff - ten_min:
+                    if not task[4]:
+                        msg = "Напоминание (1 час)\n\n"
+                        msg += task[1] + "\n"
+                        msg += "Сегодня в " + 
+event_time.strftime('%H:%M')
+                        await bot.send_message(CHAT_ID, msg)
+                        c.execute("UPDATE tasks SET reminded_1h = 1 
+WHERE id = ?", (task[0],))
+                        conn.commit()
+            
+            conn.close()
+        except Exception as e:
+            print("Reminder error:", e)
+        await asyncio.sleep(30)
+
+async def evening_digest():
+    print("Digest started for", DIGEST_TIME)
+    while True:
+        try:
+            now = datetime.datetime.now()
+            parts = DIGEST_TIME.split(':')
+            digest_hour = int(parts[0])
+            digest_minute = int(parts[1])
+            
+            target = now.replace(hour=digest_hour, 
+minute=digest_minute, second=0, microsecond=0)
+            if now >= target:
+                target += datetime.timedelta(days=1)
+            
+            wait_secs = (target - now).total_seconds()
+            print("Waiting", wait_secs/3600, "hours for digest")
+            await asyncio.sleep(wait_secs)
+            
+            tomorrow = (datetime.datetime.now() + 
+datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+            week_end = (datetime.datetime.now() + 
+datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+            
+            db_path = os.path.join(DATA_DIR, 'tasks.db')
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            
+            sql = "SELECT * FROM tasks WHERE event_time LIKE ? ORDER 
+BY event_time"
+            c.execute(sql, (tomorrow + "%",))
+            tomorrow_tasks = c.fetchall()
+            
+            sql = "SELECT * FROM tasks WHERE event_time BETWEEN ? 
+AND ? ORDER BY event_time"
+            c.execute(sql, (now.strftime('%Y-%m-%d'), week_end))
+            week_tasks = c.fetchall()
+            conn.close()
+            
+            response = "Вечерний дайджест (" + 
+now.strftime('%d.%m.%Y') + ")\n\n"
+            
+            if tomorrow_tasks:
+                response += "На завтра:\n"
+                for task in tomorrow_tasks:
+                    time_part = task[2].split(' ')[1] if ' ' in 
+task[2] else '00:00'
+                    response += time_part + " - " + task[1] + "\n"
+            else:
+                response += "На завтра: задач нет\n"
+            
+            if week_tasks:
+                response += "\nНа неделю:\n"
+                for task in week_tasks[:5]:
+                    response += task[2] + " - " + task[1] + "\n"
+            
+            await bot.send_message(CHAT_ID, response)
+            print("Digest sent")
+        except Exception as e:
+            print("Digest error:", e)
+        await asyncio.sleep(60)
+
+async def start_web_server():
+    app = web.Application()
+    
+    async def handle_ping(request):
+        return web.Response(text="OK")
+    
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    print("Web server on port 8080")
+
+async def main():
+    init_db()
+    print("Bot starting...")
+    await asyncio.gather(
+        dp.start_polling(bot),
+        check_reminders(),
+        evening_digest(),
+        start_web_server()
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())import 
+os
 import asyncio
 import sqlite3
 import datetime
